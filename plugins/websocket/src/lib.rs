@@ -1,4 +1,5 @@
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use once_cell::sync::Lazy;
 use serde::{ser::Serializer, Deserialize, Serialize};
 use tauri::{
     api::ipc::{format_callback, CallbackFn},
@@ -21,6 +22,8 @@ type Id = u32;
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WebSocketWriter = SplitSink<WebSocket, Message>;
 type Result<T> = std::result::Result<T, Error>;
+
+static ID: Lazy<Mutex<Id>> = Lazy::new(|| Mutex::new(0));
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -46,6 +49,8 @@ struct ConnectionManager(Mutex<HashMap<Id, WebSocketWriter>>);
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionConfig {
     pub max_send_queue: Option<usize>,
+    pub write_buffer_size: usize,
+    pub max_write_buffer_size: usize,
     pub max_message_size: Option<usize>,
     pub max_frame_size: Option<usize>,
     pub accept_unmasked_frames: bool,
@@ -53,8 +58,11 @@ pub struct ConnectionConfig {
 
 impl From<ConnectionConfig> for WebSocketConfig {
     fn from(config: ConnectionConfig) -> Self {
+        #[allow(deprecated)]
         Self {
             max_send_queue: config.max_send_queue,
+            write_buffer_size: config.write_buffer_size,
+            max_write_buffer_size: config.max_write_buffer_size,
             max_message_size: config.max_message_size,
             max_frame_size: config.max_frame_size,
             accept_unmasked_frames: config.accept_unmasked_frames,
@@ -78,6 +86,13 @@ enum WebSocketMessage {
     Close(Option<CloseFrame>),
 }
 
+#[derive(Serialize)]
+struct ErrorMessage {
+    #[serde(rename = "type")]
+    type_: &'static str,
+    data: Error,
+}
+
 #[tauri::command]
 async fn connect<R: Runtime>(
     window: Window<R>,
@@ -85,50 +100,56 @@ async fn connect<R: Runtime>(
     callback_function: CallbackFn,
     config: Option<ConnectionConfig>,
 ) -> Result<Id> {
-    let id = rand::random();
+    let id = {
+        let mut id = ID.lock().await;
+        *id += 1;
+        *id
+    };
     let (ws_stream, _) = connect_async_with_config(url, config.map(Into::into), false).await?;
 
     tauri::async_runtime::spawn(async move {
-        let (write, read) = ws_stream.split();
+        let (write, mut read) = ws_stream.split();
         let manager = window.state::<ConnectionManager>();
         manager.0.lock().await.insert(id, write);
-        read.for_each(move |message| {
-            let window_ = window.clone();
-            async move {
-                if let Ok(Message::Close(_)) = message {
-                    let manager = window_.state::<ConnectionManager>();
-                    manager.0.lock().await.remove(&id);
+
+        while let Some(message) = read.next().await {
+            let mut is_close = false;
+            let response = match message {
+                Ok(Message::Text(t)) => serde_json::to_value(WebSocketMessage::Text(t)).unwrap(),
+                Ok(Message::Binary(t)) => {
+                    serde_json::to_value(WebSocketMessage::Binary(t)).unwrap()
+                }
+                Ok(Message::Ping(t)) => serde_json::to_value(WebSocketMessage::Ping(t)).unwrap(),
+                Ok(Message::Pong(t)) => serde_json::to_value(WebSocketMessage::Pong(t)).unwrap(),
+                Ok(Message::Close(t)) => {
+                    is_close = true;
+                    serde_json::to_value(WebSocketMessage::Close(t.map(|v| CloseFrame {
+                        code: v.code.into(),
+                        reason: v.reason.into_owned(),
+                    })))
+                    .unwrap()
+                }
+                Ok(Message::Frame(_)) => serde_json::Value::Null, // This value can't be recieved.
+                Err(e) => serde_json::to_value(ErrorMessage {
+                    type_: "Error",
+                    data: Error::from(e),
+                })
+                .unwrap(),
+            };
+            let js = format_callback(callback_function, &response)
+                .expect("unable to serialize websocket message");
+            let _ = window.eval(js.as_str());
+
+            if is_close {
+                let manager = window.state::<ConnectionManager>();
+                let writer = manager.0.lock().await.remove(&id);
+                if let Some(mut writer) = writer {
+                    let _ = writer.close().await;
                 }
 
-                let response = match message {
-                    Ok(Message::Text(t)) => {
-                        serde_json::to_value(WebSocketMessage::Text(t)).unwrap()
-                    }
-                    Ok(Message::Binary(t)) => {
-                        serde_json::to_value(WebSocketMessage::Binary(t)).unwrap()
-                    }
-                    Ok(Message::Ping(t)) => {
-                        serde_json::to_value(WebSocketMessage::Ping(t)).unwrap()
-                    }
-                    Ok(Message::Pong(t)) => {
-                        serde_json::to_value(WebSocketMessage::Pong(t)).unwrap()
-                    }
-                    Ok(Message::Close(t)) => {
-                        serde_json::to_value(WebSocketMessage::Close(t.map(|v| CloseFrame {
-                            code: v.code.into(),
-                            reason: v.reason.into_owned(),
-                        })))
-                        .unwrap()
-                    }
-                    Ok(Message::Frame(_)) => serde_json::Value::Null, // This value can't be recieved.
-                    Err(e) => serde_json::to_value(Error::from(e)).unwrap(),
-                };
-                let js = format_callback(callback_function, &response)
-                    .expect("unable to serialize websocket message");
-                let _ = window_.eval(js.as_str());
+                break;
             }
-        })
-        .await;
+        }
     });
 
     Ok(id)

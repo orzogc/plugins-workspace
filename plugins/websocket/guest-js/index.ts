@@ -17,18 +17,20 @@ export type Message =
   | MessageKind<"Pong", number[]>
   | MessageKind<"Close", CloseFrame | null>;
 
+export type ListenerArgument = Message | MessageKind<"Error", string> | null;
+
 export default class WebSocket {
   id: number;
-  private readonly listeners: Array<(arg: Message) => void>;
+  private readonly listeners: Array<(arg: ListenerArgument) => void>;
 
-  constructor(id: number, listeners: Array<(arg: Message) => void>) {
+  constructor(id: number, listeners: Array<(arg: ListenerArgument) => void>) {
     this.id = id;
     this.listeners = listeners;
   }
 
   static async connect(url: string, options?: unknown): Promise<WebSocket> {
-    const listeners: Array<(arg: Message) => void> = [];
-    const handler = (message: Message): void => {
+    const listeners: Array<(arg: ListenerArgument) => void> = [];
+    const handler = (message: ListenerArgument): void => {
       listeners.forEach((l) => l(message));
     };
 
@@ -39,7 +41,7 @@ export default class WebSocket {
     }).then((id) => new WebSocket(id, listeners));
   }
 
-  addListener(cb: (arg: Message) => void): void {
+  addListener(cb: (arg: ListenerArgument) => void): void {
     this.listeners.push(cb);
   }
 
