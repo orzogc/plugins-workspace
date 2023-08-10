@@ -17,6 +17,9 @@ use tokio_tungstenite::{
 };
 
 use std::collections::HashMap;
+use std::str::FromStr;
+use tauri::http::header::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 type Id = u32;
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -31,6 +34,10 @@ enum Error {
     Websocket(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("connection not found for the given id: {0}")]
     ConnectionNotFound(Id),
+    #[error(transparent)]
+    InvalidHeaderValue(#[from] tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue),
+    #[error(transparent)]
+    InvalidHeaderName(#[from] tokio_tungstenite::tungstenite::http::header::InvalidHeaderName),
 }
 
 impl Serialize for Error {
@@ -45,14 +52,16 @@ impl Serialize for Error {
 #[derive(Default)]
 struct ConnectionManager(Mutex<HashMap<Id, WebSocketWriter>>);
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionConfig {
     pub write_buffer_size: Option<usize>,
     pub max_write_buffer_size: Option<usize>,
     pub max_message_size: Option<usize>,
     pub max_frame_size: Option<usize>,
+    #[serde(default)]
     pub accept_unmasked_frames: bool,
+    pub headers: Option<Vec<(String, String)>>,
 }
 
 impl From<ConnectionConfig> for WebSocketConfig {
@@ -107,7 +116,17 @@ async fn connect<R: Runtime>(
         *id += 1;
         *id
     };
-    let (ws_stream, _) = connect_async_with_config(url, config.map(Into::into), false).await?;
+    let mut request = url.into_client_request()?;
+
+    if let Some(headers) = config.as_ref().and_then(|c| c.headers.as_ref()) {
+        for (k, v) in headers {
+            let header_name = HeaderName::from_str(k.as_str())?;
+            let header_value = HeaderValue::from_str(v.as_str())?;
+            request.headers_mut().insert(header_name, header_value);
+        }
+    }
+
+    let (ws_stream, _) = connect_async_with_config(request, config.map(Into::into), false).await?;
 
     tauri::async_runtime::spawn(async move {
         let (write, mut read) = ws_stream.split();

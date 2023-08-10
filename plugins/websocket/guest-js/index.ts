@@ -1,5 +1,14 @@
 import { invoke, transformCallback } from "@tauri-apps/api/tauri";
 
+export interface ConnectionConfig {
+  writeBufferSize?: number;
+  maxWriteBufferSize?: number;
+  maxMessageSize?: number;
+  maxFrameSize?: number;
+  acceptUnmaskedFrames?: boolean;
+  headers?: HeadersInit;
+}
+
 export interface MessageKind<T, D> {
   type: T;
   data: D;
@@ -28,21 +37,41 @@ export default class WebSocket {
     this.listeners = listeners;
   }
 
-  static async connect(url: string, options?: unknown): Promise<WebSocket> {
+  static async connect(
+    url: string,
+    config?: ConnectionConfig,
+  ): Promise<WebSocket> {
     const listeners: Array<(arg: ListenerArgument) => void> = [];
     const handler = (message: ListenerArgument): void => {
       listeners.forEach((l) => l(message));
     };
 
+    if (config?.headers) {
+      config.headers = Array.from(new Headers(config.headers).entries());
+    }
+
     return await invoke<number>("plugin:websocket|connect", {
       url,
       callbackFunction: transformCallback(handler),
-      options,
+      config,
     }).then((id) => new WebSocket(id, listeners));
   }
 
   addListener(cb: (arg: ListenerArgument) => void): void {
+    for (const listener of this.listeners) {
+      if (listener === cb) {
+        return;
+      }
+    }
+
     this.listeners.push(cb);
+  }
+
+  removeListener(cb: (arg: ListenerArgument) => void): void {
+    const index = this.listeners.indexOf(cb);
+    if (index > -1) {
+      this.listeners.splice(index, 1);
+    }
   }
 
   async send(message: Message | string | number[]): Promise<void> {
